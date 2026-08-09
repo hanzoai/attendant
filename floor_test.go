@@ -201,17 +201,19 @@ func TestBackchannelDoesNotTakeTheFloor(t *testing.T) {
 	f.Speaking([]string{"ana"})
 
 	// ana keeps talking. ben mutters over her, loud enough that the room ranks
-	// him first and long enough that it says so twice — a "yeah" outlasts an
-	// observer interval — but not as long as grab.
+	// him first — "Mhm. Yeah." runs about a second and a half — long enough that the room
+	// ranks him first several times over, which is exactly the case that took
+	// the floor off a speaker in a live room when grab was one interval.
 	both := []voice{{"ana", 1}, {"ben", 2}}
-	talk(f, c, 100*time.Millisecond, both...) // ben starts; the room has not noticed
-	f.Speaking([]string{"ben", "ana"})        // now it ranks him first
-	talk(f, c, 200*time.Millisecond, both...)
-	f.Speaking([]string{"ben", "ana"}) // and still does, 200ms later
-	if got := f.Holder(); got != "ana" {
-		t.Fatalf("floor went to %q after 200ms; a rival owes %v", got, grab)
+	const mhm = 1500 * time.Millisecond
+	for spent := time.Duration(0); spent < mhm; spent += notice {
+		f.Speaking([]string{"ben", "ana"}) // the room ranks the steady mutter first
+		talk(f, c, notice, both...)
+		if got := f.Holder(); got != "ana" {
+			t.Fatalf("floor went to %q after %v of backchannel; a rival owes %v",
+				got, spent+notice, grab)
+		}
 	}
-	talk(f, c, 100*time.Millisecond, both...)
 	f.Speaking([]string{"ana"}) // ben stops; ana never did
 
 	talk(f, c, 200*time.Millisecond, voice{"ana", 1})
@@ -253,6 +255,32 @@ func TestTurnBeginsBeforeWeKnewWhoseItWas(t *testing.T) {
 	}
 	t.Logf("recovered all %.0fms ben spoke before the floor was his",
 		float64(said)/rate*1000)
+}
+
+// Talk-over that its speaker then wins the floor with is not lost — it is handed
+// to their turn out of `lead`. A count that still calls it a loss overstates the
+// only number anyone has for how much this design throws away.
+func TestTalkOverThatWinsTheFloorIsNotALoss(t *testing.T) {
+	c, s := started(), &scrap{}
+	f := chair(c, s)
+
+	talk(f, c, 200*time.Millisecond, voice{"ana", 1})
+	f.Speaking([]string{"ana"})
+
+	both := []voice{{"ana", 1}, {"ben", 2}}
+	talk(f, c, notice, both...) // ben starts; the room has not ranked him yet
+	f.Speaking([]string{"ben", "ana"})
+	said := talk(f, c, grab, both...) / 2
+	f.Speaking([]string{"ben", "ana"}) // and now he takes it
+
+	if got := f.Tally().Over; got != 0 {
+		t.Fatalf("%.0fms called talk-over after all %.0fms of it was transcribed",
+			float64(got)/rate*1000, float64(said)/rate*1000)
+	}
+	turns := s.got()
+	if len(turns) != 2 || turns[1].marks()[2] < said {
+		t.Fatalf("ben's turn holds %d of the %d he spoke over ana", turns[1].marks()[2], said)
+	}
 }
 
 // A real room keeps naming a speaker after they have stopped. Measured against
@@ -459,4 +487,72 @@ func TestTheAttendantIsNotOnTheFloor(t *testing.T) {
 func TestAListenerNeedNotWatchTheFloor(t *testing.T) {
 	a := &Attendant{heard: &collector{}}
 	a.speaking([]lksdk.Participant{&lksdk.LocalParticipant{}}) // must not panic
+}
+
+// A speaker who loses the floor and takes it back inside `lead` still has those
+// seconds in hand. Handed over a second time, the notes say what they said
+// twice — and the audio is billed twice for the privilege.
+func TestAudioIsGivenToOneTurnOnly(t *testing.T) {
+	c, s := started(), &scrap{}
+	f := chair(c, s)
+
+	// ana holds and talks.
+	said := talk(f, c, 400*time.Millisecond, voice{"ana", 1})
+	f.Speaking([]string{"ana"})
+	said += talk(f, c, 400*time.Millisecond, voice{"ana", 1})
+
+	// She stops; the floor frees, and she starts again well inside `lead`.
+	c.pass(rest + beat)
+	f.look()
+	if f.Holder() != "" {
+		t.Fatal("floor still held after rest")
+	}
+	said += talk(f, c, 200*time.Millisecond, voice{"ana", 1})
+	f.Speaking([]string{"ana"})
+
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	got := 0
+	for _, turn := range s.got() {
+		got += turn.marks()[1]
+	}
+	if got != said {
+		t.Fatalf("%d samples reached a turn out of %d she spoke; %.0fms was transcribed twice",
+			got, said, float64(got-said)/rate*1000)
+	}
+	if over := f.Tally().Over; over < 0 {
+		t.Fatalf("talk-over counted %d, below zero: audio was given back more than once", over)
+	}
+}
+
+// A rival is not charged for our latency twice. They start talking; the room
+// takes an interval to rank them, and may take longer if the person they are
+// interrupting trails off slowly. The wait runs from when they STARTED, so what
+// they said in the meantime is inside `lead` and their turn opens on their first
+// word rather than a second into it.
+func TestTheWaitRunsFromWhenTheyStartedTalking(t *testing.T) {
+	c, s := started(), &scrap{}
+	f := chair(c, s)
+
+	talk(f, c, 200*time.Millisecond, voice{"ana", 1})
+	f.Speaking([]string{"ana"})
+
+	// ben starts, and the room goes on ranking ana first for a full second
+	// after — which is what a speaker trailing off looks like.
+	both := []voice{{"ana", 1}, {"ben", 2}}
+	said := talk(f, c, time.Second, both...) / 2
+	f.Speaking([]string{"ben", "ana"})
+	said += talk(f, c, grab-time.Second, both...) / 2
+	f.Speaking([]string{"ben", "ana"})
+
+	turns := s.got()
+	if len(turns) != 2 || turns[1].speaker != "ben" {
+		t.Fatalf("turns %v after %v of ben talking; the wait is %v from when he started",
+			turns, grab, grab)
+	}
+	if got := turns[1].marks()[2]; got != said {
+		t.Fatalf("ben's turn opens %.0fms in: %d of the %d samples he had spoken",
+			float64(said-got)/rate*1000, got, said)
+	}
 }

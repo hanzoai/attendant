@@ -36,7 +36,7 @@ try() { # name, test, file, from, to
 }
 
 try 'turn opens mid-word' TestTurnBeginsBeforeWeKnewWhoseItWas floor.go \
-	'lead = 1200 * time.Millisecond' 'lead = 200 * time.Millisecond'
+	'lead = 2500 * time.Millisecond' 'lead = 200 * time.Millisecond'
 
 try 'no hysteresis' TestBackchannelDoesNotTakeTheFloor floor.go \
 	'return top, now.Sub(f.from) >= grab' 'return top, true'
@@ -68,5 +68,73 @@ try 'turn left open at the end' TestCancellingSettlesTheOpenTurn floor.go \
 	'		case <-ctx.Done():
 			f.Close()' '		case <-ctx.Done():
 			_ = f'
+
+
+
+try 'chunks the wrong size' TestAPushIsWholeFramesInsideTheCeiling scribe.go \
+	'for len(t.pending) >= chunk {' 'for len(t.pending) >= chunk*3 {'
+
+try 'no rollover at the limit' TestALongTurnRollsOverRatherThanBeingRefused scribe.go \
+	'if t.sent+float64(len(pcm))/(rate*2) > span.Seconds() {' 'if false {'
+
+try 'notes read out of order' TestNotesReadInTheOrderThingsWereSaid scribe.go \
+	'seq := n.next
+	n.next++' 'seq := -n.next
+	n.next++'
+
+try 'dropped audio hidden' TestAServiceThatCannotKeepUpLosesAudioOutLoud scribe.go \
+	'	default:
+		t.to.mu.Lock()
+		t.to.lost++
+		t.to.mu.Unlock()' '	default:
+		t.to.mu.Lock()
+		t.to.mu.Unlock()'
+
+# A select with a default never waits, so adding a timeout case to it changes
+# nothing — the first version of this mutation was a no-op and the run said so.
+# Blocking Hear means taking the default away.
+try 'Hear waits for the service' TestHearDoesNotWaitForTheService scribe.go \
+	'	select {
+	case t.in <- append([]int16(nil), pcm...):
+	default:
+		t.to.mu.Lock()
+		t.to.lost++
+		t.to.mu.Unlock()
+	}' '	t.in <- append([]int16(nil), pcm...)'
+
+try 'recovered audio still called lost' TestTalkOverThatWinsTheFloorIsNotALoss floor.go \
+	'			if held[i].over {
+				f.tally.Over -= len(held[i].pcm) // spoken over the last holder, kept anyway
+			}' '			if false {
+				f.tally.Over -= len(held[i].pcm)
+			}'
+
+
+# The measured failure, pinned to the constant that fixes it: a rival that must
+# wait only one observer interval loses to a "mhm, yeah".
+try 'grab is one interval' TestBackchannelDoesNotTakeTheFloor floor.go \
+	'grab = 2 * time.Second' 'grab = 500 * time.Millisecond'
+
+
+try 'opening burst frame by frame' TestTheOpeningBurstDoesNotOverrunTheTurn floor.go \
+	'			turn.Hear(began)' '			for i := 0; i < len(began); i += 320 {
+				stop := i + 320
+				if stop > len(began) {
+					stop = len(began)
+				}
+				turn.Hear(began[i:stop])
+			}'
+
+
+try 'audio given to two turns' TestAudioIsGivenToOneTurnOnly floor.go \
+	'			if held[i].sent {
+				continue
+			}' '			if false {
+				continue
+			}'
+
+
+try 'wait starts at the report' TestTheWaitRunsFromWhenTheyStartedTalking floor.go \
+	'f.rival, f.from = top, f.began(top, now)' 'f.rival, f.from = top, now'
 
 echo 'every test earns its keep'

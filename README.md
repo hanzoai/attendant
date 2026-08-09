@@ -23,7 +23,10 @@ cost of transcribing a meeting independent of how many people are in it.
 **A turn begins before you know whose it is.** LiveKit reports a speaker on an
 interval and only when the ranking CHANGES, so the first syllables of every turn
 are spoken before any word arrives about them. Each speaker's last `lead` of
-audio is kept and handed to their turn when they take the floor.
+audio is kept and handed to their turn when they take the floor — in one piece,
+because `lead` seconds arriving at once is not a rate any room delivers at, and
+a turn that queues audio so the room never waits drops what it cannot hold.
+Frame by frame, the first thing dropped is the first thing said.
 
 **A ranking is not a census.** Measured against the live SFU: a speaker stayed
 ranked first for thirteen seconds after her last packet, and five seconds passed
@@ -32,14 +35,26 @@ that list is wrong in both directions. So the room says who is LOUDEST, the
 tracks say who is still there, and the floor reads both on its own clock.
 
 **A "mhm" is not an interruption.** A rival must be ranked first for `grab`
-before the floor moves. Because `lead` covers `notice + grab`, waiting costs
-nothing: whatever they said while we waited is still in hand when they win.
+before the floor moves. One observer interval is not enough: in a live room a
+1.5 s "mhm, yeah" took the floor off a speaker mid-sentence, because a
+backchannel holds a steady level while a speaker between words does not, and
+the room ranked the quieter one first. `grab` is two seconds — longer than
+people say "yeah" for. Waiting costs nothing, because `lead` covers
+`notice + grab`: whatever the rival said while we waited is still in hand when
+they win.
+
+**Nobody pays for our latency twice.** The wait runs from when a rival started
+making sound, not from the report that named them. Measured live: cleo began
+while ben was finishing, and by the time the room stopped ranking him she had
+been talking nearly a second — a wait starting there put the front of "I still
+owe you" outside `lead`, and her notes began "owe you the capacity numbers".
 
 **Two people talking is one transcript.** The louder holds the floor; the other
-is counted, not transcribed — `Tally.Over` is how much. An interjection that
-matters becomes the floor within `grab` and its onset is recovered from `lead`,
-so real turn-taking survives and only backchannel is dropped. A second stream
-would put the headcount back into the bill.
+is counted, not transcribed — `Tally.Over` is how much, and it gives audio back
+when the interrupter wins the floor and their turn receives it after all, so the
+number is the loss and not the overlap. An interjection that matters becomes the
+floor and its onset comes out of `lead`, so real turn-taking survives and only
+backchannel is dropped. A second stream would put the headcount back in the bill.
 
 ## Measured
 

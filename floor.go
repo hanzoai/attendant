@@ -32,14 +32,23 @@ const (
 	// first half-second precedes any word we get about them.
 	notice = 500 * time.Millisecond
 
-	// How long a rival must be the loudest before the floor moves. Long enough
-	// that a backchannel does not interrupt a sentence, short enough that a real
-	// interruption is transcribed as one.
-	grab = 500 * time.Millisecond
+	// How long a rival must be the loudest before the floor moves.
+	//
+	// This is the whole of what separates an interruption from an agreement, so
+	// it has to outlast an agreement. It does not work at one observer interval:
+	// a 1.5 s "mhm, yeah" took the floor off a speaker mid-sentence in a live
+	// room, because a backchannel holds a steady level while a speaker between
+	// words does not, and the room ranked the quieter one first. Two seconds is
+	// longer than people say "yeah" for and shorter than they interrupt for.
+	grab = 2 * time.Second
 
 	// How much of each speaker's audio is kept back, so that a turn can start
 	// before we knew it had. Must cover notice + grab or turns lose their onset.
-	lead = 1200 * time.Millisecond
+	//
+	// Waiting `grab` costs nothing because of this, and this costs nothing
+	// either: what it holds is the rival's own speech from while we waited,
+	// which was going nowhere until they won.
+	lead = 2500 * time.Millisecond
 
 	// How long the holder can go unreported before the floor is free. Shorter
 	// than this and a breath ends the turn; longer and a transcript sits open
@@ -56,7 +65,9 @@ const (
 // feeds it, and closes it when the floor moves on. Turns never overlap, so an
 // implementation never multiplexes.
 type Turn interface {
-	// Hear takes one decoded frame, in arrival order.
+	// Hear takes audio, in arrival order: a frame as the room delivers it, or
+	// the whole of what a speaker said before the floor was theirs, which
+	// arrives in one piece when the turn opens.
 	//
 	// It must not block on the network. Audio arrives on a real-time clock and
 	// every speaker's track is behind this call, so a stall here is lost audio,
@@ -85,10 +96,19 @@ type Tally struct {
 	Faults int // scribe calls that failed
 }
 
-// clip is one frame and when it arrived.
+// clip is one frame, when it arrived, whether it was counted against the holder
+// at the time, and whether a turn has had it.
+//
+// A frame spoken over the holder is a loss until its speaker takes the floor and
+// it is handed to their turn after all, so the count has to be able to give it
+// back. And a speaker who takes the floor, loses it and takes it again inside
+// `lead` still has those frames in hand: sent twice, the meeting notes say what
+// they said twice.
 type clip struct {
-	at  time.Time
-	pcm []int16
+	at   time.Time
+	pcm  []int16
+	over bool
+	sent bool
 }
 
 // Floor awards the meeting's floor and gives the holder's audio to a scribe.
@@ -172,6 +192,7 @@ func (f *Floor) Hear(speaker string, pcm []int16) {
 		if f.turn != nil {
 			f.turn.Hear(held.pcm)
 			f.tally.Kept += len(pcm)
+			f.keep[speaker][len(f.keep[speaker])-1].sent = true
 		}
 		return
 	}
@@ -179,6 +200,7 @@ func (f *Floor) Hear(speaker string, pcm []int16) {
 	// not transcribed — counted here so the loss is a number and not a guess.
 	if f.loud[speaker] {
 		f.tally.Over += len(pcm)
+		f.keep[speaker][len(f.keep[speaker])-1].over = true
 	}
 }
 
@@ -263,10 +285,30 @@ func (f *Floor) contest(loud []string, now time.Time) (string, bool) {
 		return top, true // an open floor is taken at once; there is nothing to protect
 	}
 	if f.rival != top {
-		f.rival, f.from = top, now
-		return "", false
+		f.rival, f.from = top, f.began(top, now)
 	}
 	return top, now.Sub(f.from) >= grab
+}
+
+// began is when the rival's audio starts in what is still held — how long they
+// have been talking, as nearly as anything here can know it.
+//
+// The wait runs from THERE and not from the report that named them, or a rival
+// pays for our latency twice: once waiting to be noticed and again waiting to be
+// believed. Measured live, cleo began talking while ben was finishing, and by
+// the time the room stopped ranking him she had been going nearly a second — a
+// wait starting then put the front of "I still owe you" outside `lead`, and her
+// notes began "owe you the capacity numbers".
+func (f *Floor) began(who string, now time.Time) time.Time {
+	clips := since(f.keep[who], now.Add(-lead))
+	at := now
+	for i := len(clips) - 1; i >= 0; i-- {
+		if at.Sub(clips[i].at) > notice {
+			break // a gap this long: what came before it was a different stretch
+		}
+		at = clips[i].at
+	}
+	return at
 }
 
 // award moves the floor to who: opens their turn, hands it the audio they have
@@ -291,10 +333,29 @@ func (f *Floor) award(who string, now time.Time) {
 	default:
 		f.turn, f.holder = turn, who
 		f.tally.Turns++
-		for _, c := range since(f.keep[who], now.Add(-lead)) {
-			turn.Hear(c.pcm)
-			f.tally.Kept += len(c.pcm)
-			f.tally.Lead += len(c.pcm)
+
+		// What they had already said, in ONE piece. It is `lead` seconds arriving
+		// at once, which is nothing like the pace a room delivers at: handed over
+		// frame by frame it is a hundred and twenty-five of them in a moment, and
+		// a turn that queues audio so the room never waits drops the overflow —
+		// which is the onset, the very thing this exists to protect. Measured
+		// live: cleo's turn began "owe you the capacity numbers".
+		var began []int16
+		held := since(f.keep[who], now.Add(-lead))
+		for i := range held {
+			if held[i].sent {
+				continue
+			}
+			held[i].sent = true
+			began = append(began, held[i].pcm...)
+			if held[i].over {
+				f.tally.Over -= len(held[i].pcm) // spoken over the last holder, kept anyway
+			}
+		}
+		if len(began) > 0 {
+			turn.Hear(began)
+			f.tally.Kept += len(began)
+			f.tally.Lead += len(began)
 		}
 	}
 	f.mu.Unlock()
