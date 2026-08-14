@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"math"
 	"os"
 	"testing"
@@ -18,8 +19,14 @@ func decodeOgg(t *testing.T, path string) []int16 {
 		t.Skipf("fixture missing: %v", err)
 	}
 	defer f.Close()
+	return decode(t, f)
+}
 
-	ogg, _, err := oggreader.NewWith(f)
+// decode is that conversion over anything Ogg: a fixture on disk, or the bytes
+// an answer was published from.
+func decode(t *testing.T, in io.Reader) []int16 {
+	t.Helper()
+	ogg, _, err := oggreader.NewWith(in)
 	if err != nil {
 		t.Fatalf("ogg: %v", err)
 	}

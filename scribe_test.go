@@ -6,14 +6,17 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-// service is hanzoai/speech's transcript API, answering the way it answers: a
-// session per open, a limit past which a push is refused, and the text on close.
+// service is the estate the attendant talks to, answering the way it answers:
+// hanzoai/speech's transcript API — a session per open, a limit past which a
+// push is refused, and the text on close — and beside it the two routes an
+// answer is made of, the model and the voice.
 type service struct {
 	mu      sync.Mutex
 	next    int
@@ -22,6 +25,10 @@ type service struct {
 	refused int              // pushes answered 409
 	hold    chan struct{}    // when non-nil, pushes wait on it
 	limit   float64          // seconds a session accepts before 409, 0 for no limit
+	at      string           // where an open says its session lives, empty for here
+	sent    []string         // the host each push was addressed to
+	reply   string           // what the model answers
+	asked   []string         // and what it was asked, last message first
 }
 
 func serve(t *testing.T, limit float64) (*service, string) {
@@ -37,27 +44,74 @@ func (s *service) handle(w http.ResponseWriter, r *http.Request) {
 	id = strings.TrimPrefix(id, "/")
 
 	switch {
-	case r.Method == http.MethodPost && id == "":
-		var ask map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&ask); err != nil {
+	// The model, and the voice. One service stands in for the whole estate
+	// because the attendant reaches all of it the same way.
+	case r.URL.Path == "/v1/chat/completions":
+		var heard struct {
+			Messages []struct{ Role, Content string } `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&heard); err != nil {
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		if ask["format"] != "pcm16" || ask["rate"] != float64(rate) || ask["channels"] != float64(1) {
-			http.Error(w, fmt.Sprintf("wrong shape: %v", ask), 400)
+		s.mu.Lock()
+		if n := len(heard.Messages); n > 0 {
+			s.asked = append(s.asked, heard.Messages[n-1].Content)
+		}
+		said := s.reply
+		s.mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]string{"content": said}}},
+		})
+
+	// Real kokoro output, so what the attendant publishes is the audio a room
+	// would actually be given rather than a stand-in that decodes to nothing.
+	case r.URL.Path == "/v1/audio/speech":
+		var want struct {
+			Format string `json:"response_format"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&want); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		// The service refuses a format it cannot make rather than answering in
+		// another one, so asking for the wrong container is an error and not an
+		// MP3 in an Opus track, which a room carries as nothing at all.
+		if want.Format != "opus" {
+			http.Error(w, "unsupported response_format "+want.Format, 400)
+			return
+		}
+		ogg, err := os.ReadFile("spoken.opus")
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "audio/ogg")
+		w.Write(ogg)
+
+	case r.Method == http.MethodPost && id == "":
+		var open map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&open); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if open["format"] != "pcm16" || open["rate"] != float64(rate) || open["channels"] != float64(1) {
+			http.Error(w, fmt.Sprintf("wrong shape: %v", open), 400)
 			return
 		}
 		s.mu.Lock()
 		s.next++
 		id = fmt.Sprintf("atr_%d", s.next)
 		s.got[id] = nil
+		at := s.at
 		s.mu.Unlock()
 		w.WriteHeader(201)
-		json.NewEncoder(w).Encode(state{ID: id})
+		json.NewEncoder(w).Encode(state{ID: id, At: at})
 
 	case r.Method == http.MethodPost:
 		body, _ := io.ReadAll(r.Body)
 		s.mu.Lock()
+		s.sent = append(s.sent, r.Host)
 		hold, seen := s.hold, s.got[id]
 		if seen == nil {
 			if _, live := s.got[id]; !live {
@@ -88,6 +142,7 @@ func (s *service) handle(w http.ResponseWriter, r *http.Request) {
 
 	case r.Method == http.MethodDelete:
 		s.mu.Lock()
+		s.sent = append(s.sent, r.Host)
 		pushes, live := s.got[id]
 		if !live {
 			s.mu.Unlock()
@@ -115,6 +170,35 @@ func (s *service) pushes(id string) []int {
 		return append([]int(nil), open...)
 	}
 	return append([]int(nil), s.kept[id]...)
+}
+
+// says is what the model will answer. Set through the service's own lock, like
+// everything else it holds, so the race detector has the whole picture.
+func (s *service) says(text string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reply = text
+}
+
+// asks is what the model was asked, one entry per ask.
+func (s *service) asks() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.asked...)
+}
+
+// lives is where an open will say its session lives.
+func (s *service) lives(url string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.at = url
+}
+
+// addressed is the host each push and close was sent to.
+func (s *service) addressed() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.sent...)
 }
 
 // taken is the audio the service has actually accepted, in seconds.
@@ -216,6 +300,46 @@ func TestALongTurnRollsOverRatherThanBeingRefused(t *testing.T) {
 	if !strings.Contains(said[0].Text, "atr_1") || !strings.Contains(said[0].Text, "atr_2") {
 		t.Fatalf("text %q lost a session", said[0].Text)
 	}
+}
+
+// A growing transcript is a window in ONE process's memory, and the Service
+// address in front of it round-robins per connection. speech runs two replicas,
+// so a session opened through the Service and pushed through it again lands
+// about half the time on a pod that has never heard of it and answers 404. The
+// open says where the session lives; the rest of the turn goes THERE.
+//
+// Two addresses onto one service, which is what two replicas behind a Service
+// is: the open goes in the front door and names the pod, and every push after
+// it has to be addressed to that pod.
+func TestASessionIsAddressedWhereItLives(t *testing.T) {
+	s, door := serve(t, 0)
+	pod := httptest.NewServer(http.HandlerFunc(s.handle))
+	t.Cleanup(pod.Close)
+	s.lives(pod.URL)
+
+	notes := Record(door, "whisper", "en")
+	turn, err := notes.Turn("ana", time.Now())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	turn.Hear(make([]int16, chunk))
+	if err := turn.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	want := strings.TrimPrefix(pod.URL, "http://")
+	sent := s.addressed()
+	if len(sent) == 0 {
+		t.Fatal("the turn pushed nothing at all")
+	}
+	for _, host := range sent {
+		if host != want {
+			t.Fatalf("a push went to %s; the open said the session lives at %s, "+
+				"and behind two replicas that address is a 404 for half the turn",
+				host, want)
+		}
+	}
+	t.Logf("%d pushes, all addressed to %s", len(sent), want)
 }
 
 // A turn that runs long settles after the short one that followed it. Notes read

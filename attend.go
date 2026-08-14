@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 
 	"github.com/livekit/protocol/livekit"
@@ -177,20 +178,33 @@ func (a *Attendant) listen(track *webrtc.TrackRemote, _ *lksdk.RemoteTrackPublic
 // disconnect does not stall every other room's dismissal.
 func (a *Attendant) Leave() { a.left.dismiss() }
 
-// Say publishes audio into the room. The bytes must already be Opus in an Ogg
-// container, which is what hanzoai/speech returns for response_format "opus" —
-// so nothing here encodes, and there is no encoder to keep honest.
-func (a *Attendant) Say(ogg string) error {
-	track, err := lksdk.NewLocalFileTrack(ogg)
+// Say publishes audio into the room and returns when the room has heard all of
+// it — or the moment ctx is cancelled, which is how the attendant is cut off
+// mid-sentence. The track comes down either way: one left published is a
+// microphone nobody takes down, and every answer would add another.
+//
+// The bytes must already be Opus in an Ogg container, which is what
+// hanzoai/speech returns for response_format "opus" — so nothing here encodes,
+// and there is no encoder to keep honest. They are read as they are sent, so
+// there is no file of ours on the way in or a temporary one to clean up.
+func (a *Attendant) Say(ctx context.Context, ogg io.ReadCloser) error {
+	spoken := make(chan struct{})
+	track, err := lksdk.NewLocalReaderTrack(ogg, webrtc.MimeTypeOpus,
+		lksdk.ReaderTrackWithOnWriteComplete(func() { close(spoken) }))
 	if err != nil {
-		return fmt.Errorf("attend: read speech: %w", err)
+		return fmt.Errorf("attend: speech: %w", err)
 	}
-	if _, err := a.room.LocalParticipant.PublishTrack(track, &lksdk.TrackPublicationOptions{
+	pub, err := a.room.LocalParticipant.PublishTrack(track, &lksdk.TrackPublicationOptions{
 		Source: livekit.TrackSource_MICROPHONE,
-	}); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("attend: publish: %w", err)
+	}
+	defer a.room.LocalParticipant.UnpublishTrack(pub.SID())
+
+	select {
+	case <-spoken:
+	case <-ctx.Done():
 	}
 	return nil
 }
-
-func main() {}

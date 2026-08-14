@@ -73,7 +73,7 @@ func Record(url, model, lang string) *Notes {
 
 // Turn opens a transcript for speaker.
 func (n *Notes) Turn(speaker string, at time.Time) (Turn, error) {
-	id, err := n.open()
+	id, host, err := n.open()
 	if err != nil {
 		return nil, err
 	}
@@ -82,10 +82,23 @@ func (n *Notes) Turn(speaker string, at time.Time) (Turn, error) {
 	n.next++
 	n.mu.Unlock()
 
-	t := &turn{to: n, seq: seq, speaker: speaker, at: at, id: id,
+	t := &turn{to: n, seq: seq, speaker: speaker, at: at, id: id, host: host,
 		in: make(chan []int16, queue), gone: make(chan struct{})}
 	go t.push()
 	return t, nil
+}
+
+// Spoke files what the attendant said itself. It is a participant like the rest
+// of them, and a record that leaves one out is not the meeting — this is what
+// the attendant reads back to know what it has already answered.
+//
+// Seconds stays zero: nothing was transcribed, and Seconds is the transcriber's
+// bill. Ordered like any turn, by when it began, which is when it was said.
+func (n *Notes) Spoke(speaker, text string, at time.Time) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.said[n.next] = Said{Speaker: speaker, At: at, Text: text}
+	n.next++
 }
 
 // Said is every turn closed so far, in the order the turns began. Turns close
@@ -139,6 +152,7 @@ type turn struct {
 
 	// Owned by push().
 	id      string
+	host    string // where this session lives; see open()
 	pending []byte
 	sent    float64 // seconds pushed into the current session
 	text    string  // settled text of sessions already rolled over
@@ -204,7 +218,8 @@ func (t *turn) send(pcm []byte) {
 }
 
 // roll closes the session at its limit and opens the next, keeping what the
-// closed one settled. The turn continues; only the session behind it changes.
+// closed one settled. The turn continues; only the session behind it changes —
+// and the next one may live somewhere else, so it is addressed where it says.
 func (t *turn) roll() {
 	said, err := t.close(t.id)
 	if err != nil {
@@ -214,12 +229,12 @@ func (t *turn) roll() {
 	t.text = join(t.text, said.Text)
 	t.total += said.Seconds
 
-	id, err := t.to.open()
+	id, host, err := t.to.open()
 	if err != nil {
 		t.err = err
 		return
 	}
-	t.id, t.sent = id, 0
+	t.id, t.host, t.sent = id, host, 0
 }
 
 // settle closes the session and files the turn.
@@ -241,29 +256,42 @@ func (t *turn) settle() {
 	t.to.mu.Unlock()
 }
 
-func (t *turn) url(id string) string { return t.to.url + "/v1/audio/transcript/" + id }
+func (t *turn) url(id string) string { return t.host + "/v1/audio/transcript/" + id }
 
-// state is what a push or a close answers with.
+// state is what an open, a push or a close answers with.
 type state struct {
 	ID      string  `json:"id"`
+	At      string  `json:"at"`
 	Text    string  `json:"text"`
 	Pending string  `json:"pending"`
 	Seconds float64 `json:"seconds"`
 }
 
-// open begins a session. The shape is stated in full because the service checks
-// it and refuses a mismatch rather than resampling: audio carries no header, so
-// a wrong rate is gibberish, not an error.
-func (n *Notes) open() (string, error) {
+// open begins a session, and answers with where that session lives.
+//
+// A growing transcript is a window in ONE process's memory, and a Service
+// address round-robins per connection — so the pushes after the first must go
+// to the pod that took the session, and the open says which that is. Speech
+// runs two replicas, so half of every turn would come back "no transcript"
+// addressed to the Service instead. An empty answer means there is nothing to
+// pin to (a single process), and the address we already have stands.
+//
+// The shape is stated in full because the service checks it and refuses a
+// mismatch rather than resampling: audio carries no header, so a wrong rate is
+// gibberish, not an error.
+func (n *Notes) open() (id, host string, err error) {
 	body, _ := json.Marshal(map[string]any{
 		"model": n.model, "language": n.lang,
 		"format": "pcm16", "rate": rate, "channels": channels,
 	})
 	got, err := n.post(n.url+"/v1/audio/transcript", bytes.NewReader(body), "application/json")
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return got.ID, nil
+	if got.At == "" {
+		return got.ID, n.url, nil
+	}
+	return got.ID, got.At, nil
 }
 
 func (t *turn) close(id string) (state, error) {

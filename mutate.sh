@@ -137,4 +137,36 @@ try 'audio given to two turns' TestAudioIsGivenToOneTurnOnly floor.go \
 try 'wait starts at the report' TestTheWaitRunsFromWhenTheyStartedTalking floor.go \
 	'f.rival, f.from = top, f.began(top, now)' 'f.rival, f.from = top, now'
 
+
+# A session lives in one pod's memory and the Service address in front of it
+# round-robins: ignoring where the open says it lives is a 404 for half a turn.
+try 'session addressed at the service' TestASessionIsAddressedWhereItLives scribe.go \
+	'	if got.At == "" {
+		return got.ID, n.url, nil
+	}
+	return got.ID, got.At, nil' '	return got.ID, n.url, nil'
+
+try 'answers over the speaker' TestTheAttendantWaitsForTheFloor answer.go \
+	'	if err := until(ctx, f, free); err != nil {
+		return err
+	}' '	_ = free'
+
+try 'answer cannot be interrupted' TestSomebodyTalkingCutsTheAnswerShort answer.go \
+	'	go func() {
+		if until(talking, f, busy) == nil {
+			hush()
+		}
+	}()' '	_ = busy'
+
+try 'answers itself' TestTheAttendantDoesNotAnswerItself answer.go \
+	'	if heard == a.answered {
+		return nil
+	}' '	_ = heard'
+
+try 'forgets what it said' TestWhatTheAttendantSaidIsInTheRecord answer.go \
+	'	a.Spoke(a.who, text, time.Now())' '	_ = text'
+
+try 'publishes a container the room cannot carry' TestTheAnswerIsAudioTheRoomCanPlay answer.go \
+	'"response_format": "opus"' '"response_format": "mp3"'
+
 echo 'every test earns its keep'

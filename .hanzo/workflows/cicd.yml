@@ -1,0 +1,19 @@
+# The canonical caller. All real config lives in /hanzo.yml, which
+# platform.hanzo.ai reads too.
+#
+# It does NOT roll out: the attendant is pinned to an explicit tag in
+# hanzo/universe (charts/app/values/hanzo/attendant.yaml), rolled by a reviewed
+# change there. That is what hanzo.yml means by having no `deploy:` section — a
+# patch from CI would be restored from the universe pin on cd.hanzo.ai's next
+# poll anyway.
+name: CI/CD
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+jobs:
+  cicd:
+    uses: hanzoai/ci/.hanzo/workflows/build.yml@v1
+    secrets: inherit

@@ -1,0 +1,28 @@
+# Canonical CI/CD config for hanzoai/attendant — read by the hanzoai/ci reusable
+# (.hanzo/workflows/cicd.yml) and by platform.hanzo.ai.
+#
+# No deploy: here. cd.hanzo.ai rolls the fleet from a pinned tag in
+# hanzo/universe (charts/app/values/hanzo/attendant.yaml), so a build publishes
+# an image and nothing moves until that pin does.
+images:
+  - name: attendant
+    context: .
+    dockerfile: Dockerfile
+    repo: ghcr.io/hanzoai/attendant
+
+# The suite under -race, because everything here is concurrent by nature: audio
+# arrives on one goroutine per speaker, the floor changes hands on another, and
+# the answer is formed on a third.
+#
+# ./mutate.sh is the other half of this gate and it is deliberately NOT run
+# here. It breaks each fix IN PLACE and restores it, and this runner builds the
+# image from the same working tree — a run killed between those two steps (a
+# runner takes SIGTERM on every rolling update, which is why it is given half an
+# hour to finish) would leave the mutation in the tree for the build step to
+# compile and publish. It is run before pushing instead, where the only thing it
+# can damage is a checkout.
+test:
+  - name: go-vet
+    run: go vet ./...
+  - name: go-test
+    run: go test -race -count=1 ./...
