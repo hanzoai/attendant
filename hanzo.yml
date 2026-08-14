@@ -4,6 +4,14 @@
 # No deploy: here. cd.hanzo.ai rolls the fleet from a pinned tag in
 # hanzo/universe (charts/app/values/hanzo/attendant.yaml), so a build publishes
 # an image and nothing moves until that pin does.
+
+# The floor for the series. imgver takes max(this, what is already published)
+# and adds a patch, so this is only ever read at the start — with nothing on the
+# registry yet it publishes exactly this, and every push after it takes the next
+# patch from the registry. Bump it here to jump the series, never to name a
+# build.
+version: 0.1.0
+
 images:
   - name: attendant
     context: .
