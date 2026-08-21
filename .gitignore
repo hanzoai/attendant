@@ -1,2 +1,5 @@
 *.patch
 *_probe.py
+
+# the built binary
+/attendant
