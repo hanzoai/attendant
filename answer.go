@@ -63,6 +63,13 @@ type Answer struct {
 	// Turns already answered. Owned by the answering loop — one goroutine, so
 	// no lock, and no second answerer to share it with.
 	answered int
+
+	// What this org can do, read once from /v1/tools. Owned by the same single
+	// goroutine as `answered`, so a nil kit means "not read yet" and an empty one
+	// means "read, and there is nothing" — two different answers that must not be
+	// re-asked on every turn.
+	can  kit
+	read bool
 }
 
 // Turn records the turn as the notes do, and says so when it ends. The nudge is
@@ -194,34 +201,82 @@ func until(ctx context.Context, f *Floor, want func(holder string) bool) error {
 	return nil
 }
 
-// reply asks our model what to say about the meeting so far.
+// reply asks our model what to say about the meeting so far, and lets it act on
+// what it heard before it speaks.
+//
+// A meeting that decides something leaves the decision in the transcript, and
+// there it stays. The tools the caller's org already offers are how it leaves:
+// the model files the item itself, and then says what it did. The loop is bounded
+// because a model still calling tools is a model not answering, and the room is
+// listening to silence while it does.
 func (a *Answer) reply(ctx context.Context, meeting string) (string, error) {
-	body, _ := json.Marshal(map[string]any{
-		"model":      a.model,
-		"max_tokens": most,
-		"messages": []map[string]string{
-			{"role": "system", "content": a.prompt},
-			{"role": "user", "content": meeting},
-		},
-	})
-	got, err := ask(ctx, a.key, http.MethodPost, a.ai+"/v1/chat/completions", "application/json", body)
-	if err != nil {
-		return "", err
+	if !a.read {
+		a.can, a.read = offered(ctx, a.ai, a.key), true
 	}
-	var answered struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
+	messages := []map[string]any{
+		{"role": "system", "content": a.prompt},
+		{"role": "user", "content": meeting},
 	}
-	if err := json.Unmarshal(got, &answered); err != nil {
-		return "", fmt.Errorf("model: %w", err)
+	for round := 0; ; round++ {
+		req := map[string]any{
+			"model":      a.model,
+			"max_tokens": most,
+			"messages":   messages,
+		}
+		// The last round is asked WITHOUT tools, so the turn ends in words rather
+		// than in another call nobody hears.
+		if len(a.can) > 0 && round < rounds-1 {
+			req["tools"] = []map[string]any(a.can)
+		}
+		body, _ := json.Marshal(req)
+		got, err := ask(ctx, a.key, http.MethodPost, a.ai+"/v1/chat/completions", "application/json", body)
+		if err != nil {
+			return "", err
+		}
+		var answered struct {
+			Choices []struct {
+				Message struct {
+					Content   string `json:"content"`
+					ToolCalls []struct {
+						ID       string `json:"id"`
+						Function struct {
+							Name      string          `json:"name"`
+							Arguments json.RawMessage `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(got, &answered); err != nil {
+			return "", fmt.Errorf("model: %w", err)
+		}
+		if len(answered.Choices) == 0 {
+			return "", nil
+		}
+		msg := answered.Choices[0].Message
+		// No calls, or no rounds left to make one in: whatever it said is the turn.
+		// The room is owed words, and a call it cannot hear is not words.
+		if len(msg.ToolCalls) == 0 || round >= rounds-1 {
+			return strings.TrimSpace(msg.Content), nil
+		}
+		// The assistant turn goes back verbatim — a tool result with no call
+		// preceding it is a conversation the model cannot read.
+		var calls []map[string]any
+		for _, c := range msg.ToolCalls {
+			calls = append(calls, map[string]any{
+				"id": c.ID, "type": "function",
+				"function": map[string]any{"name": c.Function.Name, "arguments": string(c.Function.Arguments)},
+			})
+		}
+		messages = append(messages, map[string]any{"role": "assistant", "content": msg.Content, "tool_calls": calls})
+		for _, c := range msg.ToolCalls {
+			messages = append(messages, map[string]any{
+				"role":         "tool",
+				"tool_call_id": c.ID,
+				"content":      call(ctx, a.ai, a.key, c.Function.Name, c.Function.Arguments),
+			})
+		}
 	}
-	if len(answered.Choices) == 0 {
-		return "", nil
-	}
-	return strings.TrimSpace(answered.Choices[0].Message.Content), nil
 }
 
 // speak gives the answer a voice: Ogg/Opus, which is what a room carries and what
