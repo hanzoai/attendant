@@ -7,7 +7,7 @@
 #
 # Pure Go, no cgo: the Opus decoder is pion's, written in Go, so nothing here
 # links against libopus and the binary runs on a scratch-thin base.
-FROM golang:1.26.5-alpine AS build
+FROM golang:1.26.8-alpine AS build
 WORKDIR /src
 ENV GOPROXY=https://proxy.golang.org,direct
 COPY go.mod go.sum ./

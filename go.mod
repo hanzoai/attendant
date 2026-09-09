@@ -1,6 +1,6 @@
 module github.com/hanzoai/attendant
 
-go 1.26.4
+go 1.26.8
 
 require (
 	github.com/livekit/protocol v1.49.0
